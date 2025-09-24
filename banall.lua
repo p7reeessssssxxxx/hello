@@ -42,7 +42,7 @@ local Window = Rayfield:CreateWindow({
  local Button = Tab:CreateButton({
     Name = "Tap to load script",
     Callback = function()
-        
+        https://raw.githubusercontent.com/p7reeessssssxxxx/hello/refs/heads/main/DIDDENbluds.lua
     end,
  })
  
