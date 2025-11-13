@@ -37,7 +37,7 @@ local Window = Rayfield:CreateWindow({
  local Tab = Window:CreateTab("SAB OP SCRIPT", 4483362458) -- Title, Image
 
  local Section = Tab:CreateSection("tap to load script")
- Section:Set("Section Example")
+ Section:Set("STEAL A BRAINROT MAIN HUB")
  
  local Button = Tab:CreateButton({
     Name = "Tap to load script",
@@ -47,7 +47,7 @@ local Window = Rayfield:CreateWindow({
  })
 
  local Section = Tab:CreateSection("Laser lag")
- Section:Set("Section Example")
+ Section:Set("Steal a brainrot side script")
  
  local Button = Tab:CreateButton({
     Name = "Laser gun lag ",
