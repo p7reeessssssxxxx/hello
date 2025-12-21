@@ -43,7 +43,7 @@ local Window = Rayfield:CreateWindow({
  local Button = Tab:CreateButton({
     Name = "Tap to load script",
     Callback = function()
-             l
+             loadstring(game:HttpGet("https://raw.githubusercontent.com/p7reeessssssxxxx/hello/refs/heads/main/afse.lua"))()
     end,
  })
 
