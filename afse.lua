@@ -1,3 +1,6 @@
+--- SKIDDED idc bro leave me alone an open soruce script is no ones property
+
+
 -- StarterPlayerScripts/AutoTrain.client.lua
 
 local Players = game:GetService("Players")
