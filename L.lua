@@ -19,7 +19,7 @@ local Window = Rayfield:CreateWindow({
  
     Discord = {
        Enabled = true, -- Prompt the user to join your Discord server if their executor supports it
-       Invite = "tmSTMS78MZ", -- The Discord invite code, do not include discord.gg/. E.g. discord.gg/ ABCD would be ABCD
+       Invite = "fenti", -- The Discord invite code, do not include discord.gg/. E.g. discord.gg/ ABCD would be ABCD
        RememberJoins = true -- Set this to false to make them join the discord every time they load it up
     },
  
@@ -27,7 +27,7 @@ local Window = Rayfield:CreateWindow({
     KeySettings = {
        Title = "afse - autofarm",
        Subtitle = "Key System",
-       Note = "Join the discord for the key https://discord.gg/tmSTMS78MZ", -- Use this to tell the user how to get a key
+       Note = "Join the discord for the key https://discord.gg/fenti", -- Use this to tell the user how to get a key
        FileName = "Yapuh", -- It is recommended to use something unique as other scripts using Rayfield may overwrite your key file
        SaveKey = true, -- The user's key will be saved, but if you change the key, they will be unable to use your script
        GrabKeyFromSite = false, -- If this is true, set Key below to the RAW site you would like Rayfield to get the key from
