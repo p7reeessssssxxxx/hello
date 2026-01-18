@@ -23,7 +23,7 @@ local Window = Rayfield:CreateWindow({
        RememberJoins = true -- Set this to false to make them join the discord every time they load it up
     },
  
-    KeySystem = true,
+    KeySystem = false,
     KeySettings = {
        Title = "afse - autofarm",
        Subtitle = "Key System",
