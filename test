@@ -1,0 +1,744 @@
+--// ============================================================
+--// NO.FEAR LOADER v2.1 (Key System + CounterAPI + PoP Heartbeat
+--// ============================================================
+--// Key System: https://nofear.up.railway.app/keysystem
+--// Discord:    https://discord.gg/G9QSXsB9wY
+--// ============================================================
+
+--// ============================================================
+--// CONFIG — Overrideable by calling script via getfenv()
+--// ============================================================
+-- Per-game loaders set these before calling loadstring(loader)():
+--   getfenv().ScriptURL  = "https://raw.github.com/.../main.lua"
+--   getfenv().ScriptName = "Rivals"
+local _env = (getfenv and getfenv(0)) or {}
+local ScriptURL  = _env.ScriptURL  or ""
+local ScriptName = _env.ScriptName or "NoFear"
+
+--// ============================================================
+--// INTERNAL
+--// ============================================================
+local CounterNamespace = "NoFear_BlockSpin"
+local CounterKey       = "executions"
+local KEY_SERVER       = "https://nofear-proxy.gramovelook.workers.dev"
+local KEY_PAGE         = KEY_SERVER .. "/keysystem"
+local KEY_SAVE_FILE    = "nofear_key.txt"
+
+local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
+local LP          = Players.LocalPlayer
+
+-- Multi-executor request support
+local request = syn and syn.request or http_request or request or (http and http.request)
+
+-- ── Counter (background, non-blocking) ───────────────────────────────────────
+local function incrementCounter()
+    local ok, response = pcall(function()
+        return game:HttpGet("https://api.counterapi.dev/v1/" .. CounterNamespace .. "/" .. CounterKey .. "/up")
+    end)
+    if ok then
+        local decoded = pcall(function() return HttpService:JSONDecode(response) end)
+    end
+end
+
+task.spawn(function()
+    pcall(incrementCounter)
+end)
+
+
+local function readSavedKey()
+    local ok, data = pcall(readfile, KEY_SAVE_FILE)
+    if ok and data and #data > 5 then
+        return data:match("^%s*(.-)%s*$")
+    end
+    return nil
+end
+
+local function saveKey(key)
+    pcall(writefile, KEY_SAVE_FILE, key)
+end
+
+local function clearSavedKey()
+    pcall(writefile, KEY_SAVE_FILE, "")
+end
+
+
+local function getHWID()
+    -- Try executor-provided HWID functions first
+    local hwid = nil
+    pcall(function() hwid = game:GetService("RbxAnalyticsService"):GetClientId() end)
+    if not hwid or #hwid < 4 then
+        pcall(function() hwid = tostring(syn and syn.get_hwid and syn.get_hwid() or nil) end)
+    end
+    if not hwid or #hwid < 4 then
+        -- Fallback: stable fingerprint from UserId + AccountAge + locale
+        local p = Players.LocalPlayer
+        hwid = tostring(p.UserId) .. "_" .. tostring(p.AccountAge) .. "_" .. tostring(p.LocaleId)
+    end
+    return hwid
+end
+
+local HWID = getHWID()
+
+local function httpPost(url, body)
+    -- Try executor request() first
+    if request then
+        local ok, res = pcall(request, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body or "" })
+        if ok and res and res.Body and #res.Body > 0 then
+            return res.Body
+        end
+    end
+
+    -- Try http_request (some executors use this)
+    if http_request then
+        local ok, res = pcall(http_request, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body or "" })
+        if ok and res and res.Body and #res.Body > 0 then
+            return res.Body
+        end
+    end
+
+    -- Try syn.request (Synapse)
+    if syn and syn.request then
+        local ok, res = pcall(syn.request, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body or "" })
+        if ok and res and res.Body and #res.Body > 0 then
+            return res.Body
+        end
+    end
+
+    -- Fallback: HttpService:PostAsync
+    local ok, res = pcall(function()
+        return HttpService:PostAsync(url, body or "", Enum.HttpContentType.ApplicationJson, false)
+    end)
+    if ok and res and #res > 0 then return res end
+
+    return nil
+end
+
+-- ── NebulAuth PoP Session ────────────────────────────────────────────────────
+local NEBUL_BASE          = "https://api.nebulauth.com"
+local NEBUL_VERIFY_TOKEN  = "mk_at_MmkJlk0PhXlrFBo3qlR6xtyXShUm9yzcADtYYVuydfA"
+local HEARTBEAT_INTERVAL  = 120 -- 2 minutes
+
+-- HMAC-SHA256 signing using Roblox's built-in HMAC (available in executors)
+local function hmacSHA256(key, message)
+    -- Try executor-provided crypto first
+    local ok, result = pcall(function()
+        return crypt and crypt.hmac and crypt.hmac(crypt.sha256, message, key)
+    end)
+    if ok and result then return result end
+    -- Fallback: use syn.crypt or similar
+    local ok2, result2 = pcall(function()
+        return syn and syn.crypt and syn.crypt.hmac(syn.crypt.sha256, message, key)
+    end)
+    if ok2 and result2 then return result2 end
+    return nil
+end
+
+local function base64UrlDecode(s)
+    s = s:gsub("-", "+"):gsub("_", "/")
+    local pad = (4 - #s % 4) % 4
+    s = s .. string.rep("=", pad)
+    local ok, result = pcall(function()
+        return crypt and crypt.base64decode and crypt.base64decode(s)
+    end)
+    if ok and result then return result end
+    return s -- fallback raw
+end
+
+local function makeNonce()
+    return HttpService:GenerateGUID(false):gsub("-", ""):sub(1, 16)
+end
+
+local function doRequest(url, method, headers, body)
+    local result = nil
+    local done = false
+
+    task.spawn(function()
+        local ok, res
+        if request then
+            ok, res = pcall(function()
+                return request({ Url = url, Method = method, Headers = headers, Body = body or "" })
+            end)
+            if ok and res then result = res.Body end
+        end
+        -- Fallback to HttpService if request not available or failed
+        if not result then
+            ok, res = pcall(function()
+                if method == "POST" then
+                    return HttpService:PostAsync(url, body or "", Enum.HttpContentType.ApplicationJson, false)
+                else
+                    return HttpService:GetAsync(url, false)
+                end
+            end)
+            if ok and res then result = res end
+        end
+        done = true
+    end)
+
+    -- Wait max 8 seconds per request
+    local elapsed = 0
+    while not done and elapsed < 8 do
+        task.wait(0.1)
+        elapsed = elapsed + 0.1
+    end
+
+    return result
+end
+
+local function startPopHeartbeat(key)
+    task.spawn(function()
+        -- Step 1: Bootstrap — get accessToken + popKey
+        local bootstrapBody = HttpService:JSONEncode({
+            key = key,
+            hwid = HWID,
+            requestId = HttpService:GenerateGUID(false)
+        })
+        local bootstrapRaw = doRequest(
+            NEBUL_BASE .. "/api/v1/auth/verify",
+            "POST",
+            {
+                ["Content-Type"] = "application/json",
+                ["Authorization"] = "Bearer " .. NEBUL_VERIFY_TOKEN
+            },
+            bootstrapBody
+        )
+        if not bootstrapRaw then return end
+        local ok, bootstrap = pcall(HttpService.JSONDecode, HttpService, bootstrapRaw)
+        if not ok or not bootstrap or not bootstrap.valid then return end
+
+        local accessToken = bootstrap.accessToken
+        local popKey = base64UrlDecode(bootstrap.popKey or "")
+        if not accessToken or not popKey then return end
+
+        -- Step 2: Heartbeat loop using PoP session
+        while true do
+            task.wait(HEARTBEAT_INTERVAL)
+            pcall(function()
+                local path = "/api/v1/keys/verify"
+                local method = "POST"
+                local timestamp = tostring(math.floor(os.time() * 1000))
+                local nonce = makeNonce()
+                local body = HttpService:JSONEncode({
+                    key = key,
+                    requestId = HttpService:GenerateGUID(false)
+                })
+                -- SHA256 of body
+                local bodySha = ""
+                pcall(function()
+                    bodySha = crypt and crypt.sha256 and crypt.sha256(body) or ""
+                end)
+                -- Canonical string: METHOD\nPATH\nTIMESTAMP_MS\nNONCE\nSHA256_HEX(BODY)
+                local canonical = method .. "\n" .. path .. "\n" .. timestamp .. "\n" .. nonce .. "\n" .. bodySha
+                -- Sign with popKey
+                local signature = hmacSHA256(popKey, canonical) or ""
+
+                doRequest(
+                    NEBUL_BASE .. path,
+                    method,
+                    {
+                        ["Content-Type"] = "application/json",
+                        ["Authorization"] = "Bearer " .. accessToken,
+                        ["X-Timestamp"] = timestamp,
+                        ["X-Nonce"] = nonce,
+                        ["X-Signature"] = signature,
+                        ["X-Hwid"] = HWID
+                    },
+                    body
+                )
+            end)
+        end
+    end)
+end
+
+local function validateKey(key)
+    if not key or #key < 5 then return false, "No key provided" end
+
+    -- mk_live_ keys (NebulAuth) are case-sensitive, NOFEAR- keys are uppercase
+    local sendKey = key:match("^mk_") and key or key:upper()
+    local body = HttpService:JSONEncode({ key = sendKey, hwid = HWID, license_key = sendKey })
+
+    -- Try free key endpoint first (handles both mk_live_ and NOFEAR- keys)
+    local raw = httpPost(KEY_SERVER .. "/api/key/validate", body)
+    if raw then
+        local ok, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+        if ok and decoded then
+            if decoded.valid then
+                local expiresAt = tonumber(decoded.expires_at)
+                if expiresAt and expiresAt > 0 then
+                    local diff  = math.max(0, math.floor(expiresAt / 1000) - os.time())
+                    local hours = math.floor(diff / 3600)
+                    local mins  = math.floor((diff % 3600) / 60)
+                    return true, string.format("Key valid - expires in %dh %dm", hours, mins)
+                else
+                    return true, "Key valid"
+                end
+            end
+            -- If free key failed, try premium key endpoint
+            local raw2 = httpPost(KEY_SERVER .. "/api/verify", body)
+            if raw2 then
+                local ok2, dec2 = pcall(HttpService.JSONDecode, HttpService, raw2)
+                if ok2 and dec2 and dec2.success then
+                    local plan = (dec2.user and dec2.user.plan) or dec2.plan or "premium"
+                    return true, "Premium key valid - " .. plan:upper() .. " plan"
+                end
+                -- Return original free key error
+                return false, decoded.error or "Invalid or expired key"
+            end
+            return false, decoded.error or "Invalid or expired key"
+        end
+    end
+
+    warn("[NoFear] Could not reach server")
+    return false, "Could not reach server. Check your connection."
+end
+
+
+local function destroyExisting()
+    local cg = game:GetService("CoreGui")
+    pcall(function() local e = cg:FindFirstChild("NoFearKeySystem"); if e then e:Destroy() end end)
+    pcall(function() local h = gethui():FindFirstChild("NoFearKeySystem"); if h then h:Destroy() end end)
+end
+
+local function validateKeyWithTimeout(key)
+    local ok, valid, msg = pcall(validateKey, key)
+    if ok then
+        return valid, msg
+    end
+    return false, "Error validating key. Try again."
+end
+
+local function createKeyUI(onSuccess)
+    destroyExisting()
+
+    local CoreGui = game:GetService("CoreGui")
+    local UIS = game:GetService("UserInputService")
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "NoFearKeySystem"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.DisplayOrder = 999
+    pcall(function() ScreenGui.Parent = gethui() end)
+    if not ScreenGui.Parent then ScreenGui.Parent = CoreGui end
+
+    -- No backdrop tint
+    local Backdrop = Instance.new("Frame", ScreenGui)
+    Backdrop.Size = UDim2.new(1,0,1,0)
+    Backdrop.BackgroundTransparency = 1
+    Backdrop.BorderSizePixel = 0
+    Backdrop.ZIndex = 10
+
+    -- MAIN WINDOW 640x340
+    local W = Instance.new("Frame", ScreenGui)
+    W.Size = UDim2.new(0,640,0,340)
+    W.Position = UDim2.new(0.5,-320,0.5,-170)
+    W.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    W.BorderSizePixel = 1
+    W.BorderColor3 = Color3.fromRGB(50,50,50)
+    W.ZIndex = 11
+
+    -- Draggable
+    local dragging, dragStart, startPos
+    W.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; dragStart = i.Position; startPos = W.Position
+        end
+    end)
+    W.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = i.Position - dragStart
+            W.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+        end
+    end)
+
+    -- ── TOP BAR ──────────────────────────────────────────────────
+    local TopBar = Instance.new("Frame", W)
+    TopBar.Size = UDim2.new(1,0,0,32)
+    TopBar.BackgroundColor3 = Color3.fromRGB(26,26,26)
+    TopBar.BorderSizePixel = 0
+    TopBar.ZIndex = 12
+
+    Instance.new("Frame", TopBar).Size = UDim2.new(1,0,0,1)
+    local TBLine = TopBar:FindFirstChildOfClass("Frame")
+    TBLine.Position = UDim2.new(0,0,1,-1)
+    TBLine.BackgroundColor3 = Color3.fromRGB(45,45,45)
+    TBLine.BorderSizePixel = 0
+    TBLine.ZIndex = 13
+
+    -- Logo circle
+    local LogoCircle = Instance.new("Frame", TopBar)
+    LogoCircle.Size = UDim2.new(0,20,0,20)
+    LogoCircle.Position = UDim2.new(0,10,0.5,-10)
+    LogoCircle.BackgroundColor3 = Color3.fromRGB(130,0,220)
+    LogoCircle.BorderSizePixel = 0
+    LogoCircle.ZIndex = 13
+    Instance.new("UICorner", LogoCircle).CornerRadius = UDim.new(1,0)
+
+    local LogoN = Instance.new("TextLabel", LogoCircle)
+    LogoN.Size = UDim2.new(1,0,1,0)
+    LogoN.BackgroundTransparency = 1
+    LogoN.Text = "N"
+    LogoN.TextColor3 = Color3.fromRGB(255,255,255)
+    LogoN.TextSize = 12
+    LogoN.Font = Enum.Font.GothamBlack
+    LogoN.ZIndex = 14
+
+    local TitleTxt = Instance.new("TextLabel", TopBar)
+    TitleTxt.Size = UDim2.new(0,200,1,0)
+    TitleTxt.Position = UDim2.new(0,36,0,0)
+    TitleTxt.BackgroundTransparency = 1
+    TitleTxt.Text = "NoFear"
+    TitleTxt.TextColor3 = Color3.fromRGB(215,215,215)
+    TitleTxt.TextSize = 14
+    TitleTxt.Font = Enum.Font.GothamBold
+    TitleTxt.TextXAlignment = Enum.TextXAlignment.Left
+    TitleTxt.ZIndex = 13
+
+    local CloseBtn = Instance.new("TextButton", TopBar)
+    CloseBtn.Size = UDim2.new(0,32,1,0)
+    CloseBtn.Position = UDim2.new(1,-32,0,0)
+    CloseBtn.BackgroundTransparency = 1
+    CloseBtn.Text = "+"
+    CloseBtn.TextColor3 = Color3.fromRGB(110,110,110)
+    CloseBtn.TextSize = 18
+    CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.ZIndex = 13
+    CloseBtn.MouseButton1Click:Connect(function() ScreenGui:Destroy() end)
+
+    -- ── LEFT SIDEBAR 175px ────────────────────────────────────────
+    local Sidebar = Instance.new("Frame", W)
+    Sidebar.Size = UDim2.new(0,175,0,284)
+    Sidebar.Position = UDim2.new(0,0,0,32)
+    Sidebar.BackgroundColor3 = Color3.fromRGB(30,30,30)
+    Sidebar.BorderSizePixel = 0
+    Sidebar.ZIndex = 12
+
+    local SBLine = Instance.new("Frame", Sidebar)
+    SBLine.Size = UDim2.new(0,1,1,0)
+    SBLine.Position = UDim2.new(1,-1,0,0)
+    SBLine.BackgroundColor3 = Color3.fromRGB(45,45,45)
+    SBLine.BorderSizePixel = 0
+    SBLine.ZIndex = 13
+
+    -- Active nav item
+    local NavItem = Instance.new("Frame", Sidebar)
+    NavItem.Size = UDim2.new(1,-1,0,36)
+    NavItem.Position = UDim2.new(0,0,0,8)
+    NavItem.BackgroundColor3 = Color3.fromRGB(42,42,42)
+    NavItem.BorderSizePixel = 0
+    NavItem.ZIndex = 13
+
+    local NavAccent = Instance.new("Frame", NavItem)
+    NavAccent.Size = UDim2.new(0,2,1,0)
+    NavAccent.BackgroundColor3 = Color3.fromRGB(180,0,255)
+    NavAccent.BorderSizePixel = 0
+    NavAccent.ZIndex = 14
+
+    local NavIcon = Instance.new("TextLabel", NavItem)
+    NavIcon.Size = UDim2.new(0,20,1,0)
+    NavIcon.Position = UDim2.new(0,12,0,0)
+    NavIcon.BackgroundTransparency = 1
+    NavIcon.Text = "o"
+    NavIcon.TextColor3 = Color3.fromRGB(170,0,240)
+    NavIcon.TextSize = 12
+    NavIcon.Font = Enum.Font.Code
+    NavIcon.ZIndex = 14
+
+    local NavLabel = Instance.new("TextLabel", NavItem)
+    NavLabel.Size = UDim2.new(1,-38,1,0)
+    NavLabel.Position = UDim2.new(0,34,0,0)
+    NavLabel.BackgroundTransparency = 1
+    NavLabel.Text = "Key System"
+    NavLabel.TextColor3 = Color3.fromRGB(205,205,205)
+    NavLabel.TextSize = 13
+    NavLabel.Font = Enum.Font.Code
+    NavLabel.TextXAlignment = Enum.TextXAlignment.Left
+    NavLabel.ZIndex = 14
+
+    -- ── CENTER PANEL 230px ────────────────────────────────────────
+    local Center = Instance.new("Frame", W)
+    Center.Size = UDim2.new(0,230,0,284)
+    Center.Position = UDim2.new(0,175,0,32)
+    Center.BackgroundColor3 = Color3.fromRGB(34,34,34)
+    Center.BorderSizePixel = 0
+    Center.ZIndex = 12
+
+    local CLine = Instance.new("Frame", Center)
+    CLine.Size = UDim2.new(0,1,1,0)
+    CLine.Position = UDim2.new(1,-1,0,0)
+    CLine.BackgroundColor3 = Color3.fromRGB(45,45,45)
+    CLine.BorderSizePixel = 0
+    CLine.ZIndex = 13
+
+    local KeyTitle = Instance.new("TextLabel", Center)
+    KeyTitle.Size = UDim2.new(1,-20,0,28)
+    KeyTitle.Position = UDim2.new(0,14,0,10)
+    KeyTitle.BackgroundTransparency = 1
+    KeyTitle.Text = "Key"
+    KeyTitle.TextColor3 = Color3.fromRGB(210,210,210)
+    KeyTitle.TextSize = 15
+    KeyTitle.Font = Enum.Font.GothamBold
+    KeyTitle.TextXAlignment = Enum.TextXAlignment.Left
+    KeyTitle.ZIndex = 13
+
+    local KDiv = Instance.new("Frame", Center)
+    KDiv.Size = UDim2.new(1,-28,0,1)
+    KDiv.Position = UDim2.new(0,14,0,40)
+    KDiv.BackgroundColor3 = Color3.fromRGB(45,45,45)
+    KDiv.BorderSizePixel = 0
+    KDiv.ZIndex = 13
+
+    local InputLabel = Instance.new("TextLabel", Center)
+    InputLabel.Size = UDim2.new(1,-20,0,20)
+    InputLabel.Position = UDim2.new(0,14,0,50)
+    InputLabel.BackgroundTransparency = 1
+    InputLabel.Text = "Input"
+    InputLabel.TextColor3 = Color3.fromRGB(130,130,130)
+    InputLabel.TextSize = 12
+    InputLabel.Font = Enum.Font.Code
+    InputLabel.TextXAlignment = Enum.TextXAlignment.Left
+    InputLabel.ZIndex = 13
+
+    local InputBox = Instance.new("TextBox", Center)
+    InputBox.Size = UDim2.new(1,-28,0,28)
+    InputBox.Position = UDim2.new(0,14,0,72)
+    InputBox.BackgroundColor3 = Color3.fromRGB(40,40,40)
+    InputBox.BorderSizePixel = 1
+    InputBox.BorderColor3 = Color3.fromRGB(55,55,55)
+    InputBox.Text = ""
+    InputBox.PlaceholderText = "Enter your key here..."
+    InputBox.TextColor3 = Color3.fromRGB(205,205,205)
+    InputBox.PlaceholderColor3 = Color3.fromRGB(85,85,85)
+    InputBox.TextSize = 12
+    InputBox.Font = Enum.Font.Code
+    InputBox.ClearTextOnFocus = false
+    InputBox.TextXAlignment = Enum.TextXAlignment.Left
+    InputBox.ZIndex = 13
+    local IP = Instance.new("UIPadding", InputBox)
+    IP.PaddingLeft = UDim.new(0,8)
+
+    local StatusLabel = Instance.new("TextLabel", Center)
+    StatusLabel.Size = UDim2.new(1,-28,0,18)
+    StatusLabel.Position = UDim2.new(0,14,0,103)
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Text = ""
+    StatusLabel.TextColor3 = Color3.fromRGB(220,70,70)
+    StatusLabel.TextSize = 11
+    StatusLabel.Font = Enum.Font.Code
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    StatusLabel.ZIndex = 13
+
+    local EnterBtn = Instance.new("TextButton", Center)
+    EnterBtn.Size = UDim2.new(1,-28,0,28)
+    EnterBtn.Position = UDim2.new(0,14,0,122)
+    EnterBtn.BackgroundColor3 = Color3.fromRGB(44,44,44)
+    EnterBtn.BorderSizePixel = 1
+    EnterBtn.BorderColor3 = Color3.fromRGB(58,58,58)
+    EnterBtn.Text = "Enter"
+    EnterBtn.TextColor3 = Color3.fromRGB(195,195,195)
+    EnterBtn.TextSize = 13
+    EnterBtn.Font = Enum.Font.Code
+    EnterBtn.ZIndex = 13
+
+    local CopyBtn = Instance.new("TextButton", Center)
+    CopyBtn.Size = UDim2.new(1,-28,0,28)
+    CopyBtn.Position = UDim2.new(0,14,0,156)
+    CopyBtn.BackgroundColor3 = Color3.fromRGB(44,44,44)
+    CopyBtn.BorderSizePixel = 1
+    CopyBtn.BorderColor3 = Color3.fromRGB(58,58,58)
+    CopyBtn.Text = "Copy Key Link"
+    CopyBtn.TextColor3 = Color3.fromRGB(195,195,195)
+    CopyBtn.TextSize = 13
+    CopyBtn.Font = Enum.Font.Code
+    CopyBtn.ZIndex = 13
+
+    -- ── RIGHT PANEL ───────────────────────────────────────────────
+    local Right = Instance.new("Frame", W)
+    Right.Size = UDim2.new(1,-405,0,284)
+    Right.Position = UDim2.new(0,405,0,32)
+    Right.BackgroundColor3 = Color3.fromRGB(34,34,34)
+    Right.BorderSizePixel = 0
+    Right.ZIndex = 12
+
+    local InfoTitle = Instance.new("TextLabel", Right)
+    InfoTitle.Size = UDim2.new(1,-20,0,28)
+    InfoTitle.Position = UDim2.new(0,14,0,10)
+    InfoTitle.BackgroundTransparency = 1
+    InfoTitle.Text = "Information"
+    InfoTitle.TextColor3 = Color3.fromRGB(210,210,210)
+    InfoTitle.TextSize = 15
+    InfoTitle.Font = Enum.Font.GothamBold
+    InfoTitle.TextXAlignment = Enum.TextXAlignment.Left
+    InfoTitle.ZIndex = 13
+
+    local IDiv = Instance.new("Frame", Right)
+    IDiv.Size = UDim2.new(1,-28,0,1)
+    IDiv.Position = UDim2.new(0,14,0,40)
+    IDiv.BackgroundColor3 = Color3.fromRGB(45,45,45)
+    IDiv.BorderSizePixel = 0
+    IDiv.ZIndex = 13
+
+    local UpgradeHeader = Instance.new("TextLabel", Right)
+    UpgradeHeader.Size = UDim2.new(1,-20,0,18)
+    UpgradeHeader.Position = UDim2.new(0,14,0,50)
+    UpgradeHeader.BackgroundTransparency = 1
+    UpgradeHeader.Text = "Upgrade to premium?"
+    UpgradeHeader.TextColor3 = Color3.fromRGB(200,60,80)
+    UpgradeHeader.TextSize = 12
+    UpgradeHeader.Font = Enum.Font.GothamBold
+    UpgradeHeader.TextXAlignment = Enum.TextXAlignment.Left
+    UpgradeHeader.ZIndex = 13
+
+    local UpgradeBody = Instance.new("TextLabel", Right)
+    UpgradeBody.Size = UDim2.new(1,-20,0,52)
+    UpgradeBody.Position = UDim2.new(0,14,0,68)
+    UpgradeBody.BackgroundTransparency = 1
+    UpgradeBody.Text = "Get premium from our\nDiscord Server to support us\nand skip the key system."
+    UpgradeBody.TextColor3 = Color3.fromRGB(155,155,155)
+    UpgradeBody.TextSize = 11
+    UpgradeBody.Font = Enum.Font.Code
+    UpgradeBody.TextXAlignment = Enum.TextXAlignment.Left
+    UpgradeBody.TextYAlignment = Enum.TextYAlignment.Top
+    UpgradeBody.TextWrapped = true
+    UpgradeBody.ZIndex = 13
+
+    local CheckHeader = Instance.new("TextLabel", Right)
+    CheckHeader.Size = UDim2.new(1,-20,0,18)
+    CheckHeader.Position = UDim2.new(0,14,0,128)
+    CheckHeader.BackgroundTransparency = 1
+    CheckHeader.Text = "How do checkpoints work?"
+    CheckHeader.TextColor3 = Color3.fromRGB(200,60,80)
+    CheckHeader.TextSize = 12
+    CheckHeader.Font = Enum.Font.GothamBold
+    CheckHeader.TextXAlignment = Enum.TextXAlignment.Left
+    CheckHeader.ZIndex = 13
+
+    local CheckBody = Instance.new("TextLabel", Right)
+    CheckBody.Size = UDim2.new(1,-20,0,36)
+    CheckBody.Position = UDim2.new(0,14,0,146)
+    CheckBody.BackgroundTransparency = 1
+    CheckBody.Text = "Each checkpoint gives you\n12 hours of access per key."
+    CheckBody.TextColor3 = Color3.fromRGB(155,155,155)
+    CheckBody.TextSize = 11
+    CheckBody.Font = Enum.Font.Code
+    CheckBody.TextXAlignment = Enum.TextXAlignment.Left
+    CheckBody.TextYAlignment = Enum.TextYAlignment.Top
+    CheckBody.ZIndex = 13
+
+    -- ── BOTTOM BAR ────────────────────────────────────────────────
+    local BottomBar = Instance.new("Frame", W)
+    BottomBar.Size = UDim2.new(1,0,0,24)
+    BottomBar.Position = UDim2.new(0,0,1,-24)
+    BottomBar.BackgroundColor3 = Color3.fromRGB(26,26,26)
+    BottomBar.BorderSizePixel = 0
+    BottomBar.ZIndex = 12
+
+    local BBLine = Instance.new("Frame", BottomBar)
+    BBLine.Size = UDim2.new(1,0,0,1)
+    BBLine.BackgroundColor3 = Color3.fromRGB(45,45,45)
+    BBLine.BorderSizePixel = 0
+    BBLine.ZIndex = 13
+
+    local BottomTxt = Instance.new("TextLabel", BottomBar)
+    BottomTxt.Size = UDim2.new(1,0,1,0)
+    BottomTxt.BackgroundTransparency = 1
+    BottomTxt.Text = "Key System - discord.gg/G9QSXsB9wY"
+    BottomTxt.TextColor3 = Color3.fromRGB(85,85,85)
+    BottomTxt.TextSize = 11
+    BottomTxt.Font = Enum.Font.Code
+    BottomTxt.ZIndex = 13
+
+    -- ── BUTTON LOGIC ──────────────────────────────────────────────
+    local busy = false
+
+    EnterBtn.MouseButton1Click:Connect(function()
+        if busy then return end
+        busy = true
+        -- mk_live_ keys are case-sensitive, preserve case
+        local key = InputBox.Text:match("^%s*(.-)%s*$")
+        if #key < 5 then
+            StatusLabel.TextColor3 = Color3.fromRGB(220,70,70)
+            StatusLabel.Text = "Please enter a valid key."
+            busy = false
+            return
+        end
+        EnterBtn.Text = "Checking..."
+        StatusLabel.Text = ""
+
+        local valid, msg = validateKeyWithTimeout(key)
+
+        if valid then
+            saveKey(key)
+            StatusLabel.TextColor3 = Color3.fromRGB(80,200,120)
+            StatusLabel.Text = "Key accepted!"
+            EnterBtn.Text = "Loading..."
+            task.wait(1)
+            ScreenGui:Destroy()
+            onSuccess()
+        else
+            StatusLabel.TextColor3 = Color3.fromRGB(220,70,70)
+            StatusLabel.Text = msg or "Invalid key."
+            EnterBtn.Text = "Enter"
+            busy = false
+        end
+    end)
+
+    CopyBtn.MouseButton1Click:Connect(function()
+        pcall(function() setclipboard(KEY_PAGE) end)
+        CopyBtn.Text = "Copied!"
+        task.wait(2)
+        CopyBtn.Text = "Copy Key Link"
+    end)
+end
+
+local function runWithKeyCheck(callback)
+    -- 1. Try cached key
+    local cached = readSavedKey()
+    if cached and #cached > 5 then
+        local valid, msg = validateKeyWithTimeout(cached)
+        if valid then
+            print("[NoFear] Key valid: " .. tostring(msg))
+            -- Start PoP heartbeat for mk_live_ keys
+            if cached:match("^mk_") then
+                startPopHeartbeat(cached)
+            end
+            callback()
+            return
+        else
+            print("[NoFear] Cached key invalid: " .. tostring(msg))
+            clearSavedKey()
+        end
+    end
+
+    -- 2. Show key UI, run callback after success
+    print("[NoFear] Key required - showing key UI")
+    createKeyUI(function()
+        print("[NoFear] Key accepted - loading " .. ScriptName)
+        -- Start PoP heartbeat after key UI success
+        local savedKey = readSavedKey()
+        if savedKey and savedKey:match("^mk_") then
+            startPopHeartbeat(savedKey)
+        end
+        callback()
+    end)
+end
+
+-- ── Standalone vs Module mode ─────────────────────────────────────────────────
+if ScriptURL and #ScriptURL > 10 then
+    -- Standalone mode: key check then load the script
+    runWithKeyCheck(function()
+        local ok, src = pcall(game.HttpGet, game, ScriptURL)
+        if ok and src then
+            loadstring(src)()
+        else
+            warn("[NoFear] Failed to load script from GitHub. Check ScriptURL.")
+        end
+    end)
+else
+    -- Module mode: return runWithKeyCheck so the calling script can use it
+    return runWithKeyCheck
+end
+
